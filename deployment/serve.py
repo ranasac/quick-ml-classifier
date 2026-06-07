@@ -153,12 +153,17 @@ class PredictionResponse(BaseModel):
 def _enrich(txn: TransactionInput) -> Dict[str, Any]:
     from datetime import datetime, timezone
     dt = datetime.fromtimestamp(txn.timestamp, tz=timezone.utc)
+    # day_of_week matches PySpark's convention: dayofweek()-1 where dayofweek()
+    # returns 1=Sunday, 2=Monday, ..., 7=Saturday → 0=Sunday … 6=Saturday.
+    # Python's isoweekday() returns 1=Monday … 7=Sunday, so Sunday needs special
+    # handling: (isoweekday() % 7) gives 0=Sun, 1=Mon, ..., 6=Sat.
+    day_of_week = dt.isoweekday() % 7  # 0=Sun, 1=Mon, …, 6=Sat
     return {
         "merchant_category": txn.merchant_category,
         "device_type": txn.device_type,
         "transaction_amount": txn.transaction_amount,
         "hour_of_day": dt.hour,
-        "day_of_week": dt.weekday(),
+        "day_of_week": day_of_week,
         "txn_count_1h": txn.txn_count_1h,
         "total_amount_1h": txn.total_amount_1h,
         "txn_count_24h": txn.txn_count_24h,

@@ -249,7 +249,7 @@ def run_consumer(
 
     bronze_tbl = get_or_create_table(catalog, "bronze", "transactions", BRONZE_SCHEMA)
     silver_tbl = get_or_create_table(catalog, "silver", "transactions_labeled", SILVER_SCHEMA)
-    gold_tbl = get_or_create_table(catalog, "gold", "features", GOLD_SCHEMA)
+    gold_tbl = get_or_create_table(catalog, "gold", "ml_features", GOLD_SCHEMA)
 
     label_cache = LabelCache(api_url)
 

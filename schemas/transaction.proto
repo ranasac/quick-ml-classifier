@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package fraud_detection;
+
+option java_package = "com.fraud_detection.schema";
+option java_outer_classname = "TransactionProto";
+
+// Enumeration of supported merchant categories
+enum MerchantCategory {
+  MERCHANT_CATEGORY_UNSPECIFIED = 0;
+  ELECTRONICS = 1;
+  GROCERY = 2;
+  TRAVEL = 3;
+  DINING = 4;
+  ENTERTAINMENT = 5;
+  FASHION = 6;
+  HEALTH = 7;
+}
+
+// Enumeration of device types
+enum DeviceType {
+  DEVICE_TYPE_UNSPECIFIED = 0;
+  MOBILE = 1;
+  DESKTOP = 2;
+  TABLET = 3;
+  POS_TERMINAL = 4;
+}
+
+// Core transaction message – new optional fields may be added (backward-compatible)
+message Transaction {
+  string customer_id         = 1;
+  double transaction_amount  = 2;
+  MerchantCategory merchant_category = 3;
+  DeviceType device_type     = 4;
+  int64 timestamp            = 5;
+
+  // Optional enrichment fields (backward-compatible additions)
+  optional string session_id = 6;
+  optional string ip_address = 7;
+}
+
+// Label message returned by the /labels endpoint
+message TransactionLabel {
+  string customer_id = 1;
+  string label       = 2;  // "fraud" | "non_fraud"
+}
+
+// Wrapper for batch ingestion
+message TransactionBatch {
+  repeated Transaction transactions = 1;
+  int64 batch_timestamp = 2;
+}

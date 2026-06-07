@@ -1,0 +1,287 @@
+version: "3.9"
+
+# Full local stack: data API + Kafka + Iceberg (MinIO) + MLflow + Monitoring
+# Usage: docker compose up --build
+
+networks:
+  fraud-net:
+    name: fraud-net
+
+volumes:
+  minio-data:
+  mlflow-data:
+  zookeeper-data:
+  kafka-data:
+
+services:
+
+  # ── Data source API ──────────────────────────────────────────────────────────
+  data-api:
+    build:
+      context: .
+      dockerfile: services/data_api/Dockerfile
+    container_name: data-api
+    ports:
+      - "8000:8000"
+    networks:
+      - fraud-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      retries: 3
+
+  # ── Zookeeper ────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    networks:
+      - fraud-net
+
+  # ── Kafka ────────────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - fraud-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      retries: 5
+
+  # ── Confluent Schema Registry ────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: schema-registry
+    depends_on:
+      - kafka
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8085
+    ports:
+      - "8085:8085"
+    networks:
+      - fraud-net
+
+  # ── MinIO (S3-compatible object store for Iceberg warehouse) ─────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-04-18T19-09-19Z
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - fraud-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 3
+
+  # ── MinIO bucket initialiser ─────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:RELEASE.2024-04-18T16-45-29Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/warehouse &&
+        mc mb --ignore-existing local/mlflow-artifacts
+      "
+    networks:
+      - fraud-net
+
+  # ── Iceberg REST Catalog ─────────────────────────────────────────────────────
+  iceberg-rest:
+    image: tabulario/iceberg-rest:0.10.0
+    container_name: iceberg-rest
+    depends_on:
+      - minio-init
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+    ports:
+      - "8181:8181"
+    networks:
+      - fraud-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 10s
+      retries: 5
+
+  # ── MLflow Tracking Server ───────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.12.2
+    container_name: mlflow
+    depends_on:
+      - minio-init
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:////mlflow/mlflow.db
+        --default-artifact-root s3://mlflow-artifacts/
+        --host 0.0.0.0
+        --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    networks:
+      - fraud-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      retries: 5
+
+  # ── Kafka producer ───────────────────────────────────────────────────────────
+  kafka-producer:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile.producer
+    container_name: kafka-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      data-api:
+        condition: service_healthy
+    environment:
+      DATA_API_URL: http://data-api:8000
+      KAFKA_BROKERS: kafka:9092
+    networks:
+      - fraud-net
+
+  # ── Kafka consumer (Medallion) ───────────────────────────────────────────────
+  kafka-consumer:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile.consumer
+    container_name: kafka-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      ICEBERG_CATALOG_URI: http://iceberg-rest:8181
+      DATA_API_URL: http://data-api:8000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      S3_ENDPOINT: http://minio:9000
+    networks:
+      - fraud-net
+
+  # ── Inference service ────────────────────────────────────────────────────────
+  fraud-classifier:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile
+    container_name: fraud-classifier
+    depends_on:
+      - mlflow
+    environment:
+      MLFLOW_MODEL_URI: models:/fraud-classifier/Production
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      FRAUD_THRESHOLD: "0.5"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "8080:8080"
+    networks:
+      - fraud-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ping"]
+      interval: 10s
+      retries: 5
+
+  # ── Prometheus ───────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    networks:
+      - fraud-net
+
+  # ── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - fraud-net
+
+  # ── OpenTelemetry Collector ──────────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - fraud-net
+
+  # ── Jaeger ───────────────────────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.56
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+    networks:
+      - fraud-net

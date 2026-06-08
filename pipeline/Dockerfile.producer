@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir confluent-kafka requests protobuf
+COPY pipeline/kafka_producer.py kafka_producer.py
+COPY schemas/ schemas/
+CMD ["python", "kafka_producer.py"]
